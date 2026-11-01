@@ -1,0 +1,478 @@
+import os
+import re
+from collections import Counter
+
+import re
+from yandex_ai_studio_sdk import AIStudio
+
+import fitz                                
+from bs4 import BeautifulSoup
+
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
+
+# Настройки
+DIR        = r'C:\Данные_pdf'
+QDRANT     = r"C:\Директория_питон_файла"
+COLLECTION = "documents"
+
+
+# Очистка и нормализация текста
+
+def normalize_text(text: str) -> str:
+    """Убирает переносы по дефису, пробелы/табуляции,
+    оставляет осмысленные переводы строк (для дальнейшего чанкинга)."""
+    if not text:
+        return ""
+    text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def strip_repeated_lines(pages_text: list[str], threshold: float = 0.6) -> list[str]:
+    """Удаляет повторяющиеся колонтитулы PDF"""
+    if len(pages_text) < 3:
+        return pages_text
+    n = len(pages_text)
+    counter = Counter()
+    for txt in pages_text:
+        lines = [l.strip() for l in txt.splitlines() if l.strip()]
+        if lines:
+            counter[lines[0]] += 1
+            if len(lines) > 1:
+                counter[lines[-1]] += 1
+    repeated = {ln for ln, cnt in counter.items()
+                if cnt / n >= threshold and len(ln) < 200}
+    cleaned_pages = []
+    for txt in pages_text:
+        kept = [l for l in txt.splitlines() if l.strip() not in repeated]
+        cleaned_pages.append("\n".join(kept))
+    return cleaned_pages
+
+
+# Парсинг PDF
+
+def _detect_pdf_headings(doc) -> dict[int, str]:
+    headings: dict[int, str] = {}
+    try:
+        for _lvl, title, page in doc.get_toc(simple=True):
+            if page >= 1 and title.strip():
+                headings[page] = title.strip()
+    except Exception:
+        pass
+    return headings
+
+
+def _extract_pdf_tables(page) -> list[str]:
+    """Извлечение таблиц штатным"""
+    result: list[str] = []
+    try:
+        finder = page.find_tables()
+    except Exception:
+        return result
+    for tbl in getattr(finder, "tables", []) or []:
+        try:
+            data = tbl.extract()
+        except Exception:
+            continue
+        rows = []
+        for row in data or []:
+            cells = [(c or "").strip() for c in row]
+            if any(cells):
+                rows.append(" | ".join(cells))
+        if rows:
+            result.append("\n".join(rows))
+    return result
+
+
+def _extract_pdf_page_text(page) -> str:
+    """Блочное извлечение с детекцией заголовков по размеру шрифта."""
+    try:
+        d = page.get_text("dict")
+        sizes = [
+            span["size"]
+            for b in d.get("blocks", []) if b.get("type") == 0
+            for l in b.get("lines", [])
+            for span in l.get("spans", [])
+            if span.get("text", "").strip()
+        ]
+        if not sizes:
+            return page.get_text("text")
+        median_size = sorted(sizes)[len(sizes) // 2]
+
+        parts = []
+        for b in d.get("blocks", []):
+            if b.get("type") != 0:
+                continue
+            block_lines, is_heading = [], False
+            for line in b.get("lines", []):
+                line_text = "".join(
+                    span.get("text", "") for span in line.get("spans", [])
+                ).strip()
+                if not line_text:
+                    continue
+                span_sizes = [
+                    span["size"] for span in line["spans"]
+                    if span.get("text", "").strip()
+                ]
+                if span_sizes and max(span_sizes) > median_size * 1.15:
+                    is_heading = True
+                block_lines.append(line_text)
+            if not block_lines:
+                continue
+            text = " ".join(block_lines)
+            parts.append(f"\n## {text}\n" if is_heading else text)
+        return "\n".join(parts)
+    except Exception:
+        return page.get_text("text")
+
+
+def load_pdf(path: str) -> list[Document]:
+    source = os.path.basename(path)
+    docs: list[Document] = []
+
+    pdf = fitz.open(path)
+    try:
+        # Заголовки из TOC
+        toc_headings = _detect_pdf_headings(pdf)
+
+        # Текст + таблицы постранично
+        raw_pages: list[str] = []
+        tables_by_page: dict[int, list[str]] = {}
+        for pn, page in enumerate(pdf, start=1):
+            raw_pages.append(_extract_pdf_page_text(page))
+            tables = _extract_pdf_tables(page)
+            if tables:
+                tables_by_page[pn] = tables
+
+        # Снять повторяющиеся колонтитулы
+        raw_pages = strip_repeated_lines(raw_pages)
+
+        current_header = "Начало"
+        toc_pages_sorted = sorted(toc_headings)
+        for pn, page_text in enumerate(raw_pages, start=1):
+            # Обновить текущий заголовок по TOC
+            for tp in toc_pages_sorted:
+                if tp <= pn:
+                    current_header = toc_headings[tp]
+
+            # Приклеить таблицы
+            if pn in tables_by_page:
+                page_text += "\n\n[ТАБЛИЦЫ]\n" + "\n\n".join(tables_by_page[pn])
+
+            page_text = normalize_text(page_text)
+            if not page_text:
+                continue
+
+            # Если на странице есть внутренний «## ...» — берём как header
+            page_header = current_header
+            m = re.search(r'^##\s+(.+)$', page_text, re.MULTILINE)
+            if m:
+                page_header = m.group(1).strip()
+
+            docs.append(Document(
+                page_text,
+                metadata={
+                    "source":    source,
+                    "page":      pn,
+                    "header":    page_header,
+                    "file_type": "pdf",
+                },
+            ))
+    finally:
+        pdf.close()
+    return docs
+
+
+# Парсинг HTML
+
+_HTML_SKIP_INSIDE = {"table", "dl", "pre", "code"}
+
+
+def _html_block_to_text(el) -> str:
+    """Продвинутое извлечение: таблицы, списки определений, код."""
+    name = el.name
+    if name == "table":
+        rows = []
+        for tr in el.find_all("tr"):
+            cells = [c.get_text(" ", strip=True)
+                     for c in tr.find_all(["th", "td"])]
+            if any(cells):
+                rows.append(" | ".join(cells))
+        return "\n".join(rows)
+    if name in ("pre", "code"):
+        return "```\n" + el.get_text("\n", strip=False) + "\n```"
+    if name == "dl":
+        parts = []
+        for child in el.find_all(["dt", "dd"], recursive=False):
+            prefix = "### " if child.name == "dt" else "- "
+            parts.append(prefix + child.get_text(" ", strip=True))
+        return "\n".join(parts)
+    return el.get_text(" ", strip=True)
+
+
+def load_html(path: str) -> list[Document]:
+    source = os.path.basename(path)
+    with open(path, encoding="utf-8") as f:
+        soup = BeautifulSoup(f.read(), "html.parser")
+
+    page_title = (
+        soup.title.get_text(strip=True) if soup.title else "Начало"
+    ) or "Начало"
+    content = soup.find(id="mw-content-text") or soup.body or soup
+
+    docs: list[Document] = []
+    header = page_title
+    section_idx = 0
+
+    for el in content.find_all(
+        ["h1", "h2", "h3", "h4", "p", "li", "table", "dl", "pre", "figcaption"]
+    ):
+        skip = False
+        for p in el.parents:
+            if p is content:
+                break
+            if getattr(p, "name", None) in _HTML_SKIP_INSIDE:
+                skip = True
+                break
+        if skip:
+            continue
+
+        if el.name in ("h1", "h2", "h3", "h4"):
+            header = el.get_text(strip=True) or "Без заголовка"
+            section_idx += 1
+            continue
+
+        text = normalize_text(_html_block_to_text(el))
+        if not text:
+            continue
+
+        docs.append(Document(
+            text,
+            metadata={
+                "source":    source,
+                "page":      max(section_idx, 1),
+                "header":    header,
+                "file_type": "html",
+            },
+        ))
+    return docs
+
+def structure_aware_split(docs: list[Document]) -> list[Document]:
+    size_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+
+    result: list[Document] = []
+    for doc in docs:
+        text = doc.page_content
+        parts = re.split(r'(?m)(?=^#{2,3}\s)', text)
+
+        current_header = doc.metadata["header"]
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+
+            m = re.match(r'^#{2,3}\s+(.+)', part)
+            if m:
+                current_header = m.group(1).strip()
+
+            chunks = [part] if len(part) <= 500 else size_splitter.split_text(part)
+
+            for ch in chunks:
+                ch = normalize_text(ch)
+                if not ch:
+                    continue
+                result.append(Document(
+                    ch,
+                    metadata={
+                        "source":    doc.metadata["source"],
+                        "page":      doc.metadata["page"],
+                        "header":    current_header,
+                        "file_type": doc.metadata["file_type"],
+                    },
+                ))
+    return result
+
+
+
+documents = []
+for name in os.listdir(DIR):
+    path = os.path.join(DIR, name)
+    try:
+        if name.lower().endswith(".pdf"):
+            documents += load_pdf(path)
+        elif name.lower().endswith((".html", ".htm")):
+            documents += load_html(path)
+    except Exception as e:
+        print(f"[WARN] Не удалось обработать {name}: {e}")
+
+splits = structure_aware_split(documents)
+
+
+embeddings = HuggingFaceEmbeddings(model_name='sergeyzh/rubert-tiny-sts-v2')
+
+if 'client' in globals():
+    client.close()
+client = QdrantClient(path=QDRANT)
+
+if client.collection_exists(COLLECTION):
+    client.delete_collection(COLLECTION)
+client.create_collection(
+    COLLECTION,
+    vectors_config=VectorParams(size=len(embeddings.embed_query("probe")),
+                                distance=Distance.COSINE),
+)
+
+vector_store = QdrantVectorStore(
+    client=client, collection_name=COLLECTION, embedding=embeddings,
+)
+vector_store.add_documents(splits)
+
+
+
+retriever = vector_store.as_retriever(
+    search_type="similarity_score_threshold",
+    search_kwargs={
+        "k": 5,
+        "score_threshold": 0.7,
+    },
+)
+
+demo_questions = [
+        "Римская империя?",
+        "Как оформить больничный лист?",
+        "Правила внутреннего трудового распорядка",
+    ]
+for q in demo_questions:
+    print("=" * 72)
+    print(f"ЗАПРОС: {q}")
+    print("=" * 72)
+    hits = retriever.invoke(q)
+    for i, d in enumerate(hits, 1):
+        md = d.metadata
+        print(f"\n[{i}] source={md['source']} | page={md['page']} "
+                f"| header={md['header']} | file_type={md['file_type']}")
+        print("    " + d.page_content[:300].replace("\n", " ") + "...")
+    print()
+
+
+# Вызываем llm модель
+YC_API_KEY_ID = '....'
+YC_API_KEY = '....'
+YC_FOLDER_ID = '....' 
+
+sdk = AIStudio(folder_id=YC_FOLDER_ID, auth=YC_API_KEY)
+model = sdk.models.completions('yandexgpt-lite')
+model = model.configure(temperature=0.1, max_tokens=1024)
+
+# Промт с цитированием
+
+def build_prompt(question: str, hits: list) -> str:
+    """Собирает промпт: вопрос + контекст с явными метками источников."""
+    if not hits:
+        return (
+            f"Вопрос пользователя: {question}\n\n"
+            "В базе знаний нет информации по этому вопросу. "
+            "Ответь: 'В предоставленных документах нет информации для ответа на этот вопрос.'"
+        )
+
+    context_blocks = []
+    for i, doc in enumerate(hits, 1):
+        md = doc.metadata
+        source_label = (
+            f"[{i}] {md.get('source', '?')}, "
+            f"стр. {md.get('page', '?')}, "
+            f"раздел: {md.get('header', '?')}"
+        )
+        context_blocks.append(
+            f"--- ИСТОЧНИК {source_label} ---\n{doc.page_content}"
+        )
+
+    context_text = "\n\n".join(context_blocks)
+
+    return f"""Ты — ассистент, который отвечает на вопросы ТОЛЬКО на основе предоставленных фрагментов документов.
+
+ПРАВИЛА:
+1. Используй только информацию из блоков «ИСТОЧНИК» ниже.
+2. Каждое утверждение в ответе сопровождай ссылкой на номер источника в квадратных скобках, например: [1] или [2].
+3. Если в источниках нет ответа — прямо напиши: «В предоставленных документах нет информации для ответа на этот вопрос.» Не выдумывай.
+4. Не пересказывай источники целиком — дай краткий ответ по существу.
+
+ВОПРОС ПОЛЬЗОВАТЕЛЯ:
+{question}
+
+ИСТОЧНИКИ:
+{context_text}
+
+ОТВЕТ (с обязательными ссылками на источники):"""
+
+
+# ВызовLLM
+
+def ask_llm(question: str, hits: list) -> str:
+    """Отправляет вопрос + контекст в YandexGPT, возвращает текст ответа."""
+    prompt = build_prompt(question, hits)
+    result = model.run(prompt)
+    for alternative in result:
+        return alternative.text
+    return "Модель не вернула ответ."
+
+
+def validate_citations(answer: str, hits_count: int) -> str:
+    """Предупреждает, если модель сослалась на несуществующий источник."""
+    cited = {int(n) for n in re.findall(r'\[(\d+)\]', answer)}
+    invalid = {n for n in cited if n < 1 or n > hits_count}
+    if invalid:
+        print(f"[WARN] Модель сослалась на несуществующие источники: {invalid}")
+    return answer
+
+
+# Цикл работы
+def answer_question(question: str, k: int = 3) -> dict:
+    """Полный пайплайн RAG: поиск фрагментов + ответ LLM со ссылками."""
+    hits = retriever.invoke(question)
+
+    print("\n--- Найденные фрагменты ---")
+    if not hits:
+        print("  (ничего не найдено)")
+    else:
+        for i, d in enumerate(hits, 1):
+            md = d.metadata
+            print(f"[{i}] {md.get('source', '?')} | стр. {md.get('page', '?')} "
+                  f"| {md.get('header', '?')}")
+            print(f"    {d.page_content[:150].replace(chr(10), ' ')}...")
+
+    answer = ask_llm(question, hits)
+    validate_citations(answer, len(hits))
+
+    return {"question": question, "answer": answer, "sources": hits}
+
+
+questions = [
+    "Когда пала Римская империя?",
+    "Как устроена телеграфная азбука?",
+    "Сколько дней отпуска положено сотруднику?",  # заведомо не по теме
+    "Что ты знаешь о теории расчесывания ежа?",
+    "Как подготовить данные для отчета?"
+
+]
+
+for q in questions:
+    print("\n" + "=" * 72)
+    print(f"ВОПРОС: {q}")
+    print("=" * 72)
+
+    result = answer_question(q)
+
+    print("\n--- ОТВЕТ МОДЕЛИ ---")
+    print(result["answer"])
+    print()
